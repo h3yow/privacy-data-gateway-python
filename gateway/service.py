@@ -45,6 +45,14 @@ class GatewayService:
         self._seq_lock = threading.Lock()
         self._seq = itertools.count(1)
 
+    @property
+    def rules(self) -> RuleRegistry:
+        return self._rules
+
+    @property
+    def audit(self) -> AuditSink:
+        return self._audit
+
     def access(self, subject_id: str, record_id: str, now: datetime) -> Decision:
         """判定并呈现一次访问。
 
