@@ -21,8 +21,18 @@ class RuleSet:
     retention_days: int = 30
 
     def mode_for(self, field_name: str, subject_level: int) -> MaskMode:
-        """返回该字段对给定授权级别的呈现方式（骨架：恒 HIDDEN）。"""
-        raise NotImplementedError
+        """返回该字段对给定授权级别的呈现方式。
+
+        取主体级别可达的最高档位；无匹配档位或字段未配置时 HIDDEN。
+        结果仅取决于 (字段, 级别, 规则版本)，与请求顺序无关。
+        """
+        tiers = self.field_modes.get(field_name)
+        if not tiers:
+            return MaskMode.HIDDEN
+        reachable = [lvl for lvl in tiers if subject_level >= lvl]
+        if not reachable:
+            return MaskMode.HIDDEN
+        return tiers[max(reachable)]
 
 
 class RuleRegistry:
@@ -33,9 +43,20 @@ class RuleRegistry:
         self._current = initial
 
     def snapshot(self) -> RuleSet:
-        """获取当前规则版本的不可变快照（骨架）。"""
-        raise NotImplementedError
+        """获取当前规则版本的不可变快照。
+
+        RuleSet 为 frozen 对象，引用读取在 GIL 下原子；
+        调用方拿到的快照在整次请求中恒定，不受后续 publish 影响。
+        """
+        return self._current
 
     def publish(self, rules: RuleSet) -> None:
-        """原子发布新版本（骨架）。"""
-        raise NotImplementedError
+        """原子发布新版本：单次引用替换，旧版本不被修改。
+
+        切换期间并发请求各自持有切换前或切换后的完整快照，
+        不会混用新旧两套规则。
+        """
+        if not isinstance(rules, RuleSet):
+            raise TypeError("rules must be an immutable RuleSet")
+        with self._lock:
+            self._current = rules
