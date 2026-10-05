@@ -7,25 +7,29 @@ from datetime import datetime
 
 from .audit import AuditSink
 from .authz import SubjectStore
-from .models import AuditEvent, Decision, DenyReason, MaskMode, SensitiveRecord
+from .decision import Evaluation, evaluate, mask_value
+from .models import AuditEvent, Decision, DenyReason
 from .rules import RuleRegistry
 
-
-def mask_value(value: str) -> str:
-    """确定性脱敏：同一输入恒得同一输出，与请求顺序、缓存无关。"""
-    if len(value) <= 2:
-        return "*" * len(value)
-    return value[0] + "*" * (len(value) - 2) + value[-1]
+__all__ = ["RecordStore", "GatewayService", "mask_value"]
 
 
 class RecordStore:
     """记录仓库（内存实现）。"""
 
-    def __init__(self, records: dict[str, SensitiveRecord] | None = None) -> None:
-        self._records: dict[str, SensitiveRecord] = dict(records or {})
+    def __init__(self, records: dict | None = None) -> None:
+        self._records: dict = dict(records or {})
 
-    def get(self, record_id: str) -> SensitiveRecord | None:
+    def get(self, record_id: str):
         return self._records.get(record_id)
+
+    def upsert(self, record) -> None:
+        """写入/替换记录（供演示与测试构造数据漂移场景）。"""
+        self._records[record.record_id] = record
+
+    def delete(self, record_id: str) -> None:
+        """删除记录（供测试构造记录缺失场景）。"""
+        self._records.pop(record_id, None)
 
 
 class GatewayService:
@@ -53,6 +57,51 @@ class GatewayService:
     def audit(self) -> AuditSink:
         return self._audit
 
+    def next_sequence(self) -> int:
+        """分配全局唯一、严格递增的审计序号（实时访问与合规入口共用）。"""
+        with self._seq_lock:
+            return next(self._seq)
+
+    def write_audit_event(
+        self,
+        *,
+        timestamp: datetime,
+        subject_id: str,
+        record_id: str,
+        rule_version: int,
+        allowed: bool,
+        reason: DenyReason | None,
+        presented: dict[str, str],
+        action: str = "access",
+        archive_id: str | None = None,
+        subject_level: int | None = None,
+    ) -> bool:
+        """先落审计。返回是否写入成功；失败时调用方必须整次失败。
+
+        所有入口（实时访问、历史查询、封存、复核、规则发布）都走这里，
+        保证"审计失败即失败、不放数据、不留半条记录"的语义全局一致。
+        """
+        with self._seq_lock:
+            seq = next(self._seq)
+        event = AuditEvent(
+            sequence=seq,
+            timestamp=timestamp,
+            subject_id=subject_id,
+            record_id=record_id,
+            rule_version=rule_version,
+            allowed=allowed,
+            reason=reason.value if reason else None,
+            presented=dict(presented),
+            action=action,
+            archive_id=archive_id,
+            subject_level=subject_level,
+        )
+        try:
+            self._audit.write(event)
+        except Exception:
+            return False
+        return True
+
     def access(self, subject_id: str, record_id: str, now: datetime) -> Decision:
         """判定并呈现一次访问。
 
@@ -63,60 +112,31 @@ class GatewayService:
         - 同一 (主体授权, 记录, 规则版本) 的呈现结果确定。
         """
         rules = self._rules.snapshot()  # 版本快照：本请求恒定
-
-        record = self._records.get(record_id)
-        if record is None:
-            return self._conclude(subject_id, record_id, rules.version, now,
-                                  False, DenyReason.RESOURCE_NOT_FOUND, {})
-
-        level, deny = self._subjects.effective_level(subject_id, now)
-        if deny is not None:
-            return self._conclude(subject_id, record_id, rules.version, now,
-                                  False, DenyReason(deny), {})
-        assert level is not None
-        if level <= 0:
-            return self._conclude(subject_id, record_id, rules.version, now,
-                                  False, DenyReason.INSUFFICIENT_LEVEL, {})
-
-        presented: dict[str, str] = {}
-        for name in sorted(record.fields):  # 排序遍历保证确定性
-            mode = rules.mode_for(name, level)
-            if mode is MaskMode.PLAIN:
-                presented[name] = record.fields[name]
-            elif mode is MaskMode.MASKED:
-                presented[name] = mask_value(record.fields[name])
-            # HIDDEN：不出现在呈现结果中
-
-        return self._conclude(subject_id, record_id, rules.version, now,
-                              True, None, presented)
+        result = evaluate(rules, self._subjects, self._records,
+                          subject_id, record_id, now)
+        return self._conclude(subject_id, record_id, result, now)
 
     def _conclude(
         self,
         subject_id: str,
         record_id: str,
-        rule_version: int,
+        result: Evaluation,
         now: datetime,
-        allowed: bool,
-        reason: DenyReason | None,
-        presented: dict[str, str],
     ) -> Decision:
         """先落审计，再给结论；审计失败则结论改为 AUDIT_FAILURE 且不放行数据。"""
-        with self._seq_lock:
-            seq = next(self._seq)
-        event = AuditEvent(
-            sequence=seq,
+        ok = self.write_audit_event(
             timestamp=now,
             subject_id=subject_id,
             record_id=record_id,
-            rule_version=rule_version,
-            allowed=allowed,
-            reason=reason.value if reason else None,
-            presented=dict(presented),
+            rule_version=result.rule_version,
+            allowed=result.allowed,
+            reason=result.reason,
+            presented=result.presented,
+            action="access",
+            subject_level=result.subject_level,
         )
-        try:
-            self._audit.write(event)
-        except Exception:
+        if not ok:
             return Decision(False, DenyReason.AUDIT_FAILURE, subject_id,
-                            record_id, rule_version, {})
-        return Decision(allowed, reason, subject_id, record_id, rule_version,
-                        dict(presented))
+                            record_id, result.rule_version, {})
+        return Decision(result.allowed, result.reason, subject_id, record_id,
+                        result.rule_version, dict(result.presented))

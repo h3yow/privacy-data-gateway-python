@@ -69,3 +69,16 @@ def registry() -> RuleRegistry:
 @pytest.fixture()
 def service(subjects, records, registry, audit) -> GatewayService:
     return GatewayService(subjects, records, registry, audit)
+
+
+@pytest.fixture(autouse=True)
+def _reset_http_globals():
+    """每个测试前重置 main.py 的全局单例，保证 HTTP 测试彼此隔离。"""
+    try:
+        import main
+    except AssertionError:
+        yield
+        return
+    main.reset_services()
+    yield
+    main.reset_services()
