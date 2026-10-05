@@ -71,3 +71,62 @@ def test_rule_publish_and_audit_export_over_http():
     clerk_v1 = [e for e in audit
                 if e["rule_version"] == 1 and e["subject_id"] == "clerk"]
     assert clerk_v1 and clerk_v1[-1]["presented"] == before["presented"]
+
+
+def test_rule_history_and_conflict_over_http():
+    c = client()
+    r = c.get("/rules", headers={"X-Subject-Id": "admin"})
+    versions = [v["version"] for v in r.json()["versions"]]
+    logger.info("历史版本列表=%s", versions)
+    assert 1 in versions and versions == sorted(versions)
+
+    r = c.get("/rules/1", headers={"X-Subject-Id": "admin"})
+    assert r.status_code == 200 and r.json()["rules"]["version"] == 1
+
+    r = c.get("/rules/9999", headers={"X-Subject-Id": "admin"})
+    assert r.status_code == 404 and r.json()["detail"]["reason"] == "VERSION_NOT_FOUND"
+
+    latest = max(versions)
+    r = c.post("/rules", json={"version": latest, "field_modes": {}})
+    logger.info("重复发布 v%d -> %s %s", latest, r.status_code, r.json())
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "VERSION_CONFLICT"
+
+
+def test_history_endpoint_rejects_unknown_subject_over_http():
+    c = client()
+    r = c.get("/rules/1", headers={"X-Subject-Id": "ghost"})
+    assert r.status_code == 401 and r.json()["detail"]["reason"] == "SUBJECT_UNKNOWN"
+    r = c.get("/rules/1", headers={"X-Subject-Id": "expired"})
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "GRANT_EXPIRED"
+
+
+def test_archive_seal_and_review_over_http():
+    c = client()
+    c.get("/records/r1", headers={"X-Subject-Id": "clerk"})
+
+    r = c.post("/archives", json={}, headers={"X-Subject-Id": "admin"})
+    assert r.status_code == 201
+    archive = r.json()["archive"]
+    aid = archive["archive_id"]
+    logger.info("封存档案 %s 条目=%d 规则版本=%s",
+                aid, archive["entry_count"], archive["rule_versions"])
+    assert archive["entry_count"] >= 1
+    assert any(e["rule_version"] in archive["rule_versions"] for e in archive["entries"])
+
+    r = c.get(f"/archives/{aid}/review", headers={"X-Subject-Id": "admin"})
+    assert r.status_code == 200
+    report = r.json()["report"]
+    logger.info("复核报告 total=%d matched=%d mismatched=%d",
+                report["total"], report["matched"], report["mismatched"])
+    assert report["total"] == report["matched"] + report["mismatched"]
+
+    r = c.get("/archives/nope/review", headers={"X-Subject-Id": "admin"})
+    assert r.status_code == 404 and r.json()["detail"]["reason"] == "ARCHIVE_NOT_FOUND"
+
+
+def test_archive_requires_level_two_over_http():
+    c = client()
+    r = c.post("/archives", json={}, headers={"X-Subject-Id": "clerk"})
+    assert r.status_code == 403 and r.json()["detail"]["reason"] == "INSUFFICIENT_LEVEL"
+    r = c.get("/archives", headers={"X-Subject-Id": "clerk"})
+    assert r.status_code == 403

@@ -23,6 +23,9 @@ class FlakySink:
             raise AuditError("simulated sink outage")
         self._inner.write(event)
 
+    def events(self):
+        return self._inner.events()
+
 
 def test_allow_and_deny_both_audited(service, audit):
     service.access("admin", "r1", NOW)     # 允许

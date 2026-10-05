@@ -12,8 +12,10 @@ class DenyReason(enum.Enum):
     SUBJECT_UNKNOWN = "SUBJECT_UNKNOWN"        # 主体不存在（未授权）
     GRANT_EXPIRED = "GRANT_EXPIRED"            # 授权已过期
     RESOURCE_NOT_FOUND = "RESOURCE_NOT_FOUND"  # 资源不存在
-    INSUFFICIENT_LEVEL = "INSUFFICIENT_LEVEL"  # 授权级别不足
-    AUDIT_FAILURE = "AUDIT_FAILURE"            # 审计写入失败，访问一并失败
+    INSUFFICIENT_LEVEL = "INSUFFICIENT_LEVEL"  # 授权级别不足/越权
+    AUDIT_FAILURE = "AUDIT_FAILURE"            # 审计写入失败，操作一并失败
+    VERSION_NOT_FOUND = "VERSION_NOT_FOUND"    # 历史规则版本不存在
+    ARCHIVE_NOT_FOUND = "ARCHIVE_NOT_FOUND"    # 封存档案不存在
 
 
 class MaskMode(enum.Enum):
@@ -65,3 +67,5 @@ class AuditEvent:
     allowed: bool
     reason: str | None
     presented: dict[str, str]
+    action: str = "ACCESS"              # ACCESS/SEAL/REVIEW/HISTORY，旧数据缺省即 ACCESS
+    subject_level: int | None = None    # 判定时主体级别；旧数据缺省 None
